@@ -4,6 +4,8 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
+from pathfinder import Pathfinder, sensor_to_cam_mode # TODO: rewrite to utils.pathfinder
+
 # TODO: move to utils
 # calibration utils
 import scipy
@@ -77,6 +79,22 @@ def from_colmap(images_txt):
 def make_matrix(data):
     return np.array([np.array(d, dtype=np.float32) for d in data[1:]]).reshape((4, 4))
 
+def extract_pinhole(filename):
+    with open(filename) as f:
+        for line in f:
+            if line[0] == '#':
+                continue
+            # line looks like: 0 PINHOLE 1872 1024 1394.6050886373168 1401.287173228876 935.753089080528 512.1488159189286
+            tmp_arr = np.array(line.rstrip().split(' '), dtype=np.float32)
+            intr_mat = np.eye(4, dtype=np.float32)
+            h, w = tmp_arr[2], tmp_arr[3]
+            intr_mat[0, 0] = tmp_arr[4]
+            intr_mat[1, 1] = tmp_arr[5]
+            intr_mat[0, 2] = tmp_arr[6]
+            intr_mat[1, 2] = tmp_arr[7]
+
+    return intr_mat, h, w
+
 # depth utils
 def unpack_float32(ar):
     r"""Unpacks an array of uint8 quadruplets back to the array of float32 values.
@@ -110,52 +128,63 @@ def load_depthmap(file):
     return depthmap
 
 # header reader
-def read_info(filename, verbose=False):
+# filename: {sensorname}_voxelhashing_info.txt
+def read_info(folder, sensor='kinect', verbose=False):
     header_data = {}
-    with open(filename) as file:
-        for line in file:
-            print(line)
-            tmp = line.strip().split('=')
-            if 'Intrinsic' in tmp[0]:
-                tmp_arr = np.array(tmp[-1].rstrip().split(' ')[1:], dtype=np.float32)
-                intr_mat = np.eye(4, dtype=np.float32)
-                intr_mat[0, 0] = tmp_arr[2]
-                intr_mat[1, 1] = tmp_arr[3]
-                intr_mat[0, 2] = tmp_arr[4]
-                intr_mat[1, 2] = tmp_arr[5]
-                header_data[tmp[0].rstrip()] = intr_mat
-            elif 'Extrinsic' in tmp[0]:
-                header_data[tmp[0].rstrip()] = make_matrix(tmp[-1].rstrip().split(' '))
-            else:
-                header_data[tmp[0].rstrip()] = tmp[-1].strip()
-                
-            if verbose:
-                print(f'{tmp[0].rstrip()}: {header_data[tmp[0].rstrip()]}')
+    sensordata = Pathfinder(data_root=f'{folder}/dataset/', raw_scans_root=f'{folder}/raw_scans/')[sensor]
+    
+    # TODO: make function for intr, extr matrices extraction
+#     intr_mat, h, w = extract_pinhole(sensordata['calibrated_intrinsics'])
+    intr_mat = np.eye(3)
+    header_data['m_calibrationColorIntrinsic'] = intr_mat # TODO: find default parameters # make_pinhole_intrmat(sensordata['pinhole_intrinsics'])
+    header_data['m_calibrationColorExtrinsic'] = np.eye(4) # sensordata['calibrated_extrinsics']
+    header_data['m_colorWidth'] = w
+    header_data['m_colorHeight'] = h
+    
+#     intr_mat, h, w = extract_pinhole(sensordata['calibrated_intrinsics'])
+    header_data['m_calibrationDepthIntrinsic'] = intr_mat # TODO: find default parameters # make_pinhole_intrmat(sensordata['pinhole_intrinsics'])
+    header_data['m_calibrationDepthExtrinsic'] = np.eye(4) # sensordata['calibrated_extrinsics']
+    header_data['m_depthWidth'] = w
+    header_data['m_depthHeight'] = h
+    
+    # TODO: for BundleFusion define DepthShift, SensorName and versionNumber
+    
+    if verbose:
+        print('header dict:', header_data)
                     
     return header_data
 
 # read scans
-def read_frames_sk3d(folder, num_frames=100, obj='amber_vase', use_images=False, light='ambient@best', mode=3, verbose=False):
+# folder: contains dataset/ and raw_scans/ subfolders, is used for creating pathfinder
+def read_frames_sk3d(folder, num_frames=100, 
+                     sensor='kinect', obj='amber_vase', 
+                     use_images=False, light='ambient@best', 
+                     mode=3, verbose=False):
+    
+    if not ('dataset' in os.listdir(folder) and 'raw_scans' in os.listdir(folder)):
+        print('Wrong path!')
+        return None
+    
+    sensordata = Pathfinder(data_root=f'{folder}/dataset/', raw_scans_root=f'{folder}/raw_scans/')[sensor]
     frames = {'m_colorCompressed': [], 'm_depthCompressed': [], 'm_cameraToWorld': [],
               'm_timeStampColor': [], 'm_timeStampDepth': [], 
               'm_colorSizeBytes': [], 'm_depthSizeBytes': []}
     frames['num_frames'] = int(num_frames)
     
-    folder_frames = folder + '/processed_scans/images/'
     for i in range(frames['num_frames']):
         if use_images:
-            im = read_image(folder_frames + f'undist/{obj}/tis_right/rgb/{light}/{i:04d}.png')
+            im = read_image(sensordata['rgb'].undistorted[light, i]) # TODO: check whether undistorted is correct option
         else:
             im = np.ones_like(im)
         
-        d = load_depthmap(folder_frames + f'depthmaps/{obj}/stl@tis_right.undist/{i:04d}.png')
+        depth = load_depthmap(sensordata['depth'].raw[i])
         if mode == 8:
 #             d[np.isnan(d)] = 1.0
             d = (d*65535).astype(np.uint16)
     
         frames['m_colorCompressed'].append(im)
         frames['m_timeStampColor'].append(i)
-        frames['m_depthCompressed'].append(d)
+        frames['m_depthCompressed'].append(depth)
         frames['m_timeStampDepth'].append(i)
         
         h, w, c = frames['m_colorCompressed'][-1].shape
@@ -163,8 +192,8 @@ def read_frames_sk3d(folder, num_frames=100, obj='amber_vase', use_images=False,
         h, w = frames['m_depthCompressed'][-1].shape
         frames['m_depthSizeBytes'].append(2*h*w) # uint16 * h * w
     
-    camposes_path = 
-    world_to_cam, index, images = from_colmap(camposes_path) # (folder + '/calibration/undist_extrinsics/_calibration/tis_right.images.txt')
+    camposes_path = sensordata['depth']['calibrated_extrinsics']
+    world_to_cam, index, images = from_colmap(camposes_path)
     frames['m_cameraToWorld'] = [np.linalg.inv(mat) for mat in world_to_cam]
     if verbose:
         print('m_cameraToWorld:', frames['m_cameraToWorld'])
@@ -188,4 +217,56 @@ def writeRGBFramesToFile_sk3d(out, rgbdframes):
 def writeBinaryDumpFile(out, info, rgbdframes):
     np.array([2], dtype=np.uint32).tofile(out) # M_CALIBRATED_SENSOR_DATA_VERSION=2 in voxel hashing
 
-    pass
+    np.array(rgbdframes['num_frames'], np.uint32).tofile(out)
+    np.array(info['m_depthWidth'], dtype=np.uint32).tofile(out)
+    np.array(info['m_depthHeight'], dtype=np.uint32).tofile(out)
+    
+    np.array(rgbdframes['num_frames'], np.uint32).tofile(out)
+    np.array(info['m_colorWidth'], dtype=np.uint32).tofile(out)
+    np.array(info['m_colorHeight'], dtype=np.uint32).tofile(out)
+    
+    info['m_calibrationDepthIntrinsic'].tofile(out)
+    np.linalg.inv(info['m_calibrationDepthIntrinsic']).tofile(out)
+    info['m_calibrationDepthExtrinsic'].tofile(out)
+    np.linalg.inv(info['m_calibrationDepthExtrinsic']).tofile(out)
+    
+    info['m_calibrationColorIntrinsic'].tofile(out)
+    np.linalg.inv(info['m_calibrationColorIntrinsic']).tofile(out)
+    info['m_calibrationColorExtrinsic'].tofile(out)
+    np.linalg.inv(info['m_calibrationColorExtrinsic']).tofile(out)
+
+    for i in range(rgbdframes['num_frames']):
+        rgbdframes['m_depthCompressed'][i].tofile(out)
+        
+    for i in range(rgbdframes['num_frames']):
+        ones = np.ones((int(info['m_colorWidth'])*int(info['m_colorHeight']), 1), dtype=np.uint8)
+        rgbw_image = np.concatenate((rgbdframes['m_colorCompressed'][i].reshape((int(info['m_colorWidth'])*int(info['m_colorHeight']), 3)),
+                             ones), axis=1)
+        np.array(rgbw_image).tofile(out)
+        
+    np.array(rgbdframes['num_frames'], dtype=np.uint64).tofile(out)
+
+    for i in range(rgbdframes['num_frames']):
+         np.array(rgbdframes['m_timeStampColor'][i], dtype=np.uint64).tofile(out)
+    
+    np.array(rgbdframes['num_frames'], dtype=np.uint64).tofile(out)
+    for i in range(rgbdframes['num_frames']):
+         np.array(rgbdframes['m_timeStampDepth'][i], dtype=np.uint64).tofile(out)
+            
+    np.array(rgbdframes['num_frames'], dtype=np.uint64).tofile(out)
+    for i in range(rgbdframes['num_frames']):
+         np.array(rgbdframes['m_cameraToWorld'][i], dtype=np.float32).tofile(out)
+
+# aggregate all functions above            
+def saveToFile(data_dir, filename_out, read_frames, write_frames, dir_out='./', mode=8):
+    num_poses = 100 # TODO: where can I get this number from file?
+    
+    if mode == 8: # SensorDataReader 
+        raise NotImplemented
+        
+    elif mode == 7 or mode == 3: # BinaryDumpReader in BundleFusion or in VoxelHashing
+        out = open(f'{dir_out}/{filename_out}.sensor', 'wb')
+        data_header = read_info(data_dir)
+        rgbdframes = read_frames(data_dir, num_frames=num_poses, mode=mode)#read rgbframes from data dir
+
+        writeBinaryDumpFile(out, data_header, rgbdframes)
